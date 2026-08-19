@@ -35,3 +35,21 @@ dotnet user-secrets set "DataGovSg:ApiKey" "<your-data-gov-sg-key>" `
 - Replace `<your-data-gov-sg-key>` with your actual Data.gov.sg API key
 - These secrets are stored locally and not committed to version control
 - Each developer must configure these secrets on their machine
+
+## Run the Starter
+
+After configuring your local secrets, you can build and run the application:
+
+```bash
+dotnet restore CarparkAvailability.slnx
+dotnet build CarparkAvailability.slnx --no-restore
+aspire run
+```
+
+### Commands Explained
+
+- **`dotnet restore`** - Restores all NuGet dependencies for the solution
+- **`dotnet build --no-restore`** - Builds the solution without re-running restore
+- **`aspire run`** - Runs the .NET Aspire application with orchestration
+
+The application will start and you can access the Aspire dashboard to monitor services and their health.
