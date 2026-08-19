@@ -1,28 +1,557 @@
 @page "/"
+@rendermode InteractiveServer
+@using System.Net.Http.Json
+@using System.Text.Json
+@using Microsoft.AspNetCore.Mvc
+@using CarparkAvailability.WebApp.Models
+@inject IHttpClientFactory HttpClientFactory
+@inject IJSRuntime JSRuntime
+@inject NavigationManager Navigation
+@inject IConfiguration Configuration
+@implements IDisposable
 
 <PageTitle>Smart Parking Navigator</PageTitle>
 
-<section class="hero">
-    <p class="eyebrow">Workshop starter</p>
-    <h1>Find a suitable HDB car park near your destination.</h1>
-    <p>
-        The Aspire application is running. Use the workshop guides to design and
-        implement destination search, live availability, filters, and map-based
-        results.
-    </p>
+<section class="navigator-page">
+    <div class="status-badge @(GetStatusBadgeClass())">
+        @if (!string.IsNullOrWhiteSpace(_statusMessage))
+        {
+            <span>@_statusMessage</span>
+        }
+    </div>
+
+    <header class="search-header">
+        <div>
+            <p class="eyebrow">Live HDB parking</p>
+            <h1>Smart Parking Navigator</h1>
+            <p class="lede">Search nearby HDB car parks, compare availability, and inspect parking constraints before you arrive.</p>
+        </div>
+        <div class="search-card">
+            <label for="destination-search">Destination</label>
+            <div class="search-row">
+                <input id="destination-search"
+                       class="search-input"
+                       placeholder="Search for an address or landmark"
+                       @bind="_destinationQuery"
+                       @bind:event="oninput" />
+                <button class="primary-button" @onclick="SearchAsync" disabled="@_busy">Search</button>
+            </div>
+            <p class="search-help">Pick a destination from autocomplete, then search within @_filterModel.MaxDistanceMetres metres.</p>
+        </div>
+    </header>
+
+    @if (!string.IsNullOrWhiteSpace(_errorMessage))
+    {
+        <div class="banner banner-error">@_errorMessage</div>
+    }
+
+    @if (!string.IsNullOrWhiteSpace(_emptyStateMessage))
+    {
+        <div class="banner banner-info">@_emptyStateMessage</div>
+    }
+
+    <div id="map" class="map-surface" role="img" aria-label="Map of nearby HDB car parks"></div>
+
+    <section class="content-grid">
+        <aside class="filters-panel">
+            <h2>Filters</h2>
+
+            <label class="field-label" for="max-distance">Search radius</label>
+            <input id="max-distance" type="range" min="100" max="500" step="50" @bind="_filterModel.MaxDistanceMetres" />
+            <span class="range-value">@_filterModel.MaxDistanceMetres metres</span>
+
+            <label class="checkbox-row">
+                <input type="checkbox" @bind="_filterModel.AvailableOnly" />
+                <span>Available lots only</span>
+            </label>
+            <label class="checkbox-row">
+                <input type="checkbox" @bind="_filterModel.FreeParking" />
+                <span>Free parking available</span>
+            </label>
+            <label class="checkbox-row">
+                <input type="checkbox" @bind="_filterModel.NightParking" />
+                <span>Night parking</span>
+            </label>
+
+            <label class="field-label" for="gantry-height">Minimum gantry height (m)</label>
+            <input id="gantry-height" class="number-input" type="number" min="0" step="0.1" @bind="_filterModel.MinGantryHeight" />
+
+            <div class="filter-group">
+                <span class="field-label">Vehicle types</span>
+                @foreach ((string code, string label) in VehicleTypeOptions)
+                {
+                    <label class="checkbox-row">
+                        <input type="checkbox" checked="@_selectedVehicleTypes.Contains(code)" @onchange="args => ToggleSelection(_selectedVehicleTypes, code, args)" />
+                        <span>@label</span>
+                    </label>
+                }
+            </div>
+
+            <div class="filter-group">
+                <span class="field-label">Car park types</span>
+                @foreach (string type in CarParkTypeOptions)
+                {
+                    <label class="checkbox-row">
+                        <input type="checkbox" checked="@_selectedCarParkTypes.Contains(type)" @onchange="args => ToggleSelection(_selectedCarParkTypes, type, args)" />
+                        <span>@type</span>
+                    </label>
+                }
+            </div>
+
+            <div class="filter-actions">
+                <button class="primary-button" @onclick="FilterAsync" disabled="@(!_hasDestination || _busy)">Apply filters</button>
+                <button class="secondary-button" @onclick="ResetFilters">Reset</button>
+            </div>
+        </aside>
+
+        <section class="results-panel">
+            <div class="results-header">
+                <h2>Nearby car parks</h2>
+                <span>@(_results.Count == 0 ? "No results" : $"{_results.Count} found")</span>
+            </div>
+
+            @if (_busy)
+            {
+                <div class="results-empty">Loading car parks…</div>
+            }
+            else if (_results.Count == 0)
+            {
+                <div class="results-empty">Search for a destination to see nearby HDB car parks.</div>
+            }
+            else
+            {
+                <ul class="results-list">
+                    @foreach (SearchResultModel result in _results)
+                    {
+                        <li>
+                            <button class="result-card @GetResultCardClass(result)" @onclick="() => SelectCarparkAsync(result.CarParkNo)">
+                                <div class="result-topline">
+                                    <strong>@result.CarParkNo</strong>
+                                    <span>@FormatDistance(result.Distance)</span>
+                                </div>
+                                <div class="result-address">@result.Address</div>
+                                <div class="result-metrics">
+                                    <span>@result.AvailableLots / @result.TotalLots lots free</span>
+                                    <span>@FormatPercent(result.OccupancyRate) available</span>
+                                    @if (result.NightParking)
+                                    {
+                                        <span>Night parking</span>
+                                    }
+                                </div>
+                                @if (result.IsStale)
+                                {
+                                    <div class="stale-chip">Stale data</div>
+                                }
+                            </button>
+                        </li>
+                    }
+                </ul>
+            }
+        </section>
+    </section>
+
+    <aside class="details-panel @(_selectedCarpark is null ? string.Empty : "details-open")">
+        @if (_selectedCarpark is not null)
+        {
+            <button class="close-button" @onclick="CloseDetails">×</button>
+            <h2>@_selectedCarpark.CarParkNo</h2>
+            <p class="detail-address">@_selectedCarpark.Address</p>
+
+            <dl class="detail-grid">
+                <div>
+                    <dt>Available lots</dt>
+                    <dd>@_selectedCarpark.AvailableLots / @_selectedCarpark.TotalLots</dd>
+                </div>
+                <div>
+                    <dt>Availability</dt>
+                    <dd>@FormatPercent(_selectedCarpark.OccupancyRate)</dd>
+                </div>
+                <div>
+                    <dt>Car park type</dt>
+                    <dd>@_selectedCarpark.CarParkType</dd>
+                </div>
+                <div>
+                    <dt>Parking system</dt>
+                    <dd>@_selectedCarpark.TypeOfParkingSystem</dd>
+                </div>
+                <div>
+                    <dt>Short-term parking</dt>
+                    <dd>@_selectedCarpark.ShortTermParking</dd>
+                </div>
+                <div>
+                    <dt>Free parking</dt>
+                    <dd>@_selectedCarpark.FreeParking</dd>
+                </div>
+                <div>
+                    <dt>Night parking</dt>
+                    <dd>@_selectedCarpark.NightParking</dd>
+                </div>
+                <div>
+                    <dt>Gantry height</dt>
+                    <dd>@_selectedCarpark.GantryHeight m</dd>
+                </div>
+                <div>
+                    <dt>Decks</dt>
+                    <dd>@_selectedCarpark.CarParkDecks</dd>
+                </div>
+                <div>
+                    <dt>Basement</dt>
+                    <dd>@_selectedCarpark.CarParkBasement</dd>
+                </div>
+                <div>
+                    <dt>Last update</dt>
+                    <dd>@FormatTimestamp(_selectedCarpark.LastUpdateTime)</dd>
+                </div>
+            </dl>
+
+            @if (_selectedCarpark.IsStale)
+            {
+                <div class="banner banner-warning">Live data for this car park is older than 5 minutes.</div>
+            }
+        }
+    </aside>
 </section>
 
-<section class="starter-grid" aria-label="Starter application status">
-    <article>
-        <h2>Frontend</h2>
-        <p>The Blazor Web App is ready for implementation.</p>
-    </article>
-    <article>
-        <h2>Backend</h2>
-        <p>ASP.NET Core, health endpoints, and the HDB dataset are wired.</p>
-    </article>
-    <article>
-        <h2>Orchestration</h2>
-        <p>.NET Aspire runs both projects and supplies API credentials.</p>
-    </article>
-</section>
+@code {
+    private static readonly (string code, string label)[] VehicleTypeOptions =
+    [
+        ("C", "Cars"),
+        ("H", "Heavy vehicles"),
+        ("M", "Motorcycles"),
+        ("Y", "Other")
+    ];
+
+    private static readonly string[] CarParkTypeOptions =
+    [
+        "SURFACE",
+        "MULTI-STOREY",
+        "BASEMENT"
+    ];
+
+    private readonly JsonSerializerOptions _jsonOptions = new(JsonSerializerDefaults.Web)
+    {
+        PropertyNameCaseInsensitive = true
+    };
+
+    private readonly FilterRequestModel _filterModel = new();
+    private readonly HashSet<string> _selectedVehicleTypes = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> _selectedCarParkTypes = new(StringComparer.OrdinalIgnoreCase);
+
+    private HttpClient _apiClient = default!;
+    private DotNetObjectReference<Home>? _dotNetReference;
+    private Timer? _statusTimer;
+    private List<SearchResultModel> _results = [];
+    private CarparkDetailResponseModel? _selectedCarpark;
+    private DataStatusResponseModel? _dataStatus;
+    private string _destinationQuery = string.Empty;
+    private string? _statusMessage;
+    private string? _errorMessage;
+    private string? _emptyStateMessage;
+    private bool _busy;
+    private bool _hasDestination;
+    private double _destinationLat = 1.3521;
+    private double _destinationLng = 103.8198;
+    private bool _disposed;
+
+    protected override async Task OnInitializedAsync()
+    {
+        _apiClient = HttpClientFactory.CreateClient("ApiApp");
+        _dotNetReference = DotNetObjectReference.Create(this);
+        await RefreshStatusAsync();
+
+        _statusTimer = new Timer(async _ =>
+        {
+            if (_disposed)
+            {
+                return;
+            }
+
+            await InvokeAsync(RefreshStatusAsync);
+        }, null, TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(30));
+    }
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (!firstRender)
+        {
+            return;
+        }
+
+        await JSRuntime.InvokeVoidAsync(
+            "smartParkingMaps.initMap",
+            Configuration["GoogleMaps__ApiKey"] ?? Configuration["GoogleMaps:ApiKey"] ?? string.Empty,
+            _destinationLat,
+            _destinationLng,
+            _dotNetReference);
+    }
+
+    private async Task SearchAsync()
+    {
+        if (!_hasDestination)
+        {
+            _errorMessage = "Select a destination from the autocomplete suggestions first.";
+            _emptyStateMessage = null;
+            return;
+        }
+
+        _busy = true;
+        _errorMessage = null;
+        _emptyStateMessage = null;
+        _selectedCarpark = null;
+        StateHasChanged();
+
+        try
+        {
+            SearchRequestModel request = new()
+            {
+                Lat = _destinationLat,
+                Lng = _destinationLng,
+                MaxDistanceMetres = _filterModel.MaxDistanceMetres
+            };
+
+            using HttpResponseMessage response = await _apiClient.PostAsJsonAsync("api/search", request);
+            if (!response.IsSuccessStatusCode)
+            {
+                _errorMessage = await ReadErrorMessageAsync(response);
+                _results = [];
+                return;
+            }
+
+            SearchResponseModel? payload = await response.Content.ReadFromJsonAsync<SearchResponseModel>(_jsonOptions);
+            _results = payload?.Results ?? [];
+            _emptyStateMessage = _results.Count == 0 ? "No car parks found within the selected search radius." : null;
+            await UpdateMapMarkersAsync();
+            await RefreshStatusAsync();
+        }
+        catch (Exception ex)
+        {
+            _errorMessage = $"Unable to search car parks right now: {ex.Message}";
+            _results = [];
+        }
+        finally
+        {
+            _busy = false;
+        }
+    }
+
+    private async Task FilterAsync()
+    {
+        if (!_hasDestination)
+        {
+            _errorMessage = "Choose a destination before applying filters.";
+            return;
+        }
+
+        _busy = true;
+        _errorMessage = null;
+        _emptyStateMessage = null;
+        _selectedCarpark = null;
+        SyncFilterSelections();
+        StateHasChanged();
+
+        try
+        {
+            _filterModel.Lat = _destinationLat;
+            _filterModel.Lng = _destinationLng;
+
+            using HttpResponseMessage response = await _apiClient.PostAsJsonAsync("api/filter", _filterModel);
+            if (!response.IsSuccessStatusCode)
+            {
+                _errorMessage = await ReadErrorMessageAsync(response);
+                _results = [];
+                return;
+            }
+
+            FilterResponseModel? payload = await response.Content.ReadFromJsonAsync<FilterResponseModel>(_jsonOptions);
+            _results = payload?.Results ?? [];
+            _emptyStateMessage = _results.Count == 0 ? "No car parks matched the current filters." : null;
+            await UpdateMapMarkersAsync();
+            await RefreshStatusAsync();
+        }
+        catch (Exception ex)
+        {
+            _errorMessage = $"Unable to apply filters right now: {ex.Message}";
+            _results = [];
+        }
+        finally
+        {
+            _busy = false;
+        }
+    }
+
+    private async Task SelectCarparkAsync(string carParkNo)
+    {
+        _errorMessage = null;
+
+        try
+        {
+            CarparkDetailResponseModel? detail = await _apiClient.GetFromJsonAsync<CarparkDetailResponseModel>($"api/carpark/{Uri.EscapeDataString(carParkNo)}", _jsonOptions);
+            if (detail is null)
+            {
+                _errorMessage = "Unable to load the selected car park.";
+                return;
+            }
+
+            _selectedCarpark = detail;
+            await JSRuntime.InvokeVoidAsync("smartParkingMaps.highlightMarker", carParkNo);
+        }
+        catch (Exception ex)
+        {
+            _errorMessage = $"Unable to load car park details: {ex.Message}";
+        }
+    }
+
+    private async Task RefreshStatusAsync()
+    {
+        try
+        {
+            _dataStatus = await _apiClient.GetFromJsonAsync<DataStatusResponseModel>("api/data-status", _jsonOptions);
+            _statusMessage = BuildStatusMessage(_dataStatus);
+        }
+        catch
+        {
+            _dataStatus = null;
+            _statusMessage = "Status unavailable";
+        }
+
+        if (!_disposed)
+        {
+            await InvokeAsync(StateHasChanged);
+        }
+    }
+
+    [JSInvokable]
+    public async Task OnMarkerClick(string carParkNo)
+        => await SelectCarparkAsync(carParkNo);
+
+    [JSInvokable]
+    public async Task OnDestinationSelected(string address, double lat, double lng)
+    {
+        _destinationQuery = address;
+        _destinationLat = lat;
+        _destinationLng = lng;
+        _hasDestination = true;
+        _errorMessage = null;
+        _emptyStateMessage = null;
+        await InvokeAsync(StateHasChanged);
+    }
+
+    private void ResetFilters()
+    {
+        _filterModel.AvailableOnly = false;
+        _filterModel.FreeParking = false;
+        _filterModel.NightParking = false;
+        _filterModel.MinGantryHeight = 0;
+        _filterModel.MaxDistanceMetres = 500;
+        _selectedVehicleTypes.Clear();
+        _selectedCarParkTypes.Clear();
+        SyncFilterSelections();
+    }
+
+    private async Task UpdateMapMarkersAsync()
+    {
+        await JSRuntime.InvokeVoidAsync("smartParkingMaps.setDestinationMarker", _destinationLat, _destinationLng);
+        await JSRuntime.InvokeVoidAsync(
+            "smartParkingMaps.setMarkers",
+            _results.Select(result => new { result.CarParkNo, result.Lat, result.Lng }).ToArray());
+    }
+
+    private static void ToggleSelection(HashSet<string> selections, string value, ChangeEventArgs args)
+    {
+        if (args.Value is bool isChecked && isChecked)
+        {
+            selections.Add(value);
+            return;
+        }
+
+        selections.Remove(value);
+    }
+
+    private void CloseDetails() => _selectedCarpark = null;
+
+    private void SyncFilterSelections()
+    {
+        _filterModel.VehicleTypes = _selectedVehicleTypes.ToList();
+        _filterModel.CarParkTypes = _selectedCarParkTypes.ToList();
+    }
+
+    private string GetResultCardClass(SearchResultModel result)
+        => string.Equals(_selectedCarpark?.CarParkNo, result.CarParkNo, StringComparison.OrdinalIgnoreCase) ? "selected" : string.Empty;
+
+    private string GetStatusBadgeClass()
+    {
+        if (_dataStatus is null)
+        {
+            return "status-neutral";
+        }
+
+        if (!_dataStatus.IsAvailable)
+        {
+            return "status-error";
+        }
+
+        return _dataStatus.IsStale ? "status-warning" : "status-ok";
+    }
+
+    private static string BuildStatusMessage(DataStatusResponseModel? status)
+    {
+        if (status is null)
+        {
+            return "Status unavailable";
+        }
+
+        if (!status.IsAvailable)
+        {
+            return "Live data unavailable";
+        }
+
+        if (!status.LastSuccessfulPoll.HasValue)
+        {
+            return "Awaiting first live update";
+        }
+
+        TimeSpan age = DateTime.UtcNow - status.LastSuccessfulPoll.Value.ToUniversalTime();
+        return status.IsStale ? $"Stale · updated {Math.Max(0, (int)age.TotalMinutes)} min ago" : $"Updated {Math.Max(0, (int)age.TotalMinutes)} min ago";
+    }
+
+    private static string FormatDistance(double distance)
+        => distance >= 1000 ? $"{distance / 1000:F1} km" : $"{distance:F0} m";
+
+    private static string FormatPercent(double value)
+        => $"{value:P0}";
+
+    private static string FormatTimestamp(DateTime? value)
+        => value.HasValue ? value.Value.ToLocalTime().ToString("dd MMM yyyy HH:mm") : "No live data";
+
+    private async Task<string> ReadErrorMessageAsync(HttpResponseMessage response)
+    {
+        try
+        {
+            ProblemDetails? problemDetails = await response.Content.ReadFromJsonAsync<ProblemDetails>(_jsonOptions);
+            if (!string.IsNullOrWhiteSpace(problemDetails?.Detail))
+            {
+                return problemDetails.Detail;
+            }
+
+            if (!string.IsNullOrWhiteSpace(problemDetails?.Title))
+            {
+                return problemDetails.Title;
+            }
+        }
+        catch
+        {
+        }
+
+        string fallback = await response.Content.ReadAsStringAsync();
+        return string.IsNullOrWhiteSpace(fallback)
+            ? "The request could not be completed."
+            : fallback;
+    }
+
+    public void Dispose()
+    {
+        _disposed = true;
+        _statusTimer?.Dispose();
+        _dotNetReference?.Dispose();
+    }
+}

@@ -6,6 +6,12 @@ builder.AddServiceDefaults();
 builder.Services
     .AddRazorComponents()
     .AddInteractiveServerComponents();
+builder.Services.AddHttpClient("ApiApp", client =>
+{
+    client.BaseAddress = new Uri(builder.Configuration["services:apiapp:https:0"]
+        ?? builder.Configuration["services:apiapp:http:0"]
+        ?? "http://localhost:5000");
+});
 
 WebApplication app = builder.Build();
 

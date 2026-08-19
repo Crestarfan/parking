@@ -1,4 +1,5 @@
 @inherits LayoutComponentBase
+@inject IConfiguration Configuration
 
 <div class="app-shell">
     <header>
@@ -9,3 +10,25 @@
         @Body
     </main>
 </div>
+
+<script src="@Assets["js/maps.js"]"></script>
+@if (!string.IsNullOrWhiteSpace(GoogleMapsScriptUrl))
+{
+    <script async defer data-google-maps="true" src="@GoogleMapsScriptUrl"></script>
+}
+
+@code {
+    private string? GoogleMapsScriptUrl
+    {
+        get
+        {
+            string? apiKey = Configuration["GoogleMaps__ApiKey"] ?? Configuration["GoogleMaps:ApiKey"];
+            if (string.IsNullOrWhiteSpace(apiKey) || apiKey.Contains("{{", StringComparison.Ordinal))
+            {
+                return null;
+            }
+
+            return $"https://maps.googleapis.com/maps/api/js?key={Uri.EscapeDataString(apiKey)}&libraries=places";
+        }
+    }
+}
